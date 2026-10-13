@@ -1,0 +1,374 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Proje dosyalarini olustur
+        run: |
+          mkdir -p app/src/main/java/com/example/altyazi app/src/main/assets app/libs
+          cat > settings.gradle.kts <<'EOF_0'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "AltyaziCeviri"
+          include(":app")
+          EOF_0
+          cat > build.gradle.kts <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_1
+          cat > gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          EOF_2
+          cat > app/build.gradle.kts <<'EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.altyazi"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.altyazi"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a") }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              androidResources { noCompress += listOf("onnx") }
+          }
+          dependencies {
+              implementation(files("libs/sherpa-onnx.aar"))
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.0")
+              implementation("com.google.mlkit:translate:17.0.3")
+              implementation("com.google.mlkit:language-id:17.0.6")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
+          }
+          EOF_3
+          cat > app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <application
+                  android:label="Altyazı Çeviri"
+                  android:theme="@android:style/Theme.Translucent.NoTitleBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".SubtitleService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection"/>
+              </application>
+          </manifest>
+          EOF_4
+          cat > app/src/main/java/com/example/altyazi/MainActivity.kt <<'EOF_5'
+          package com.example.altyazi
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+
+          class MainActivity : ComponentActivity() {
+
+              private val projection = registerForActivityResult(
+                  ActivityResultContracts.StartActivityForResult()
+              ) { r ->
+                  if (r.resultCode == Activity.RESULT_OK && r.data != null) {
+                      val i = Intent(this, SubtitleService::class.java)
+                          .putExtra("code", r.resultCode)
+                          .putExtra("data", r.data)
+                      startForegroundService(i)
+                  }
+                  finish()
+              }
+
+              private val micPermission = registerForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { ok ->
+                  if (ok) {
+                      val mpm = getSystemService(MediaProjectionManager::class.java)
+                      projection.launch(mpm.createScreenCaptureIntent())
+                  } else finish()
+              }
+
+              private val notifPermission = registerForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { micPermission.launch(android.Manifest.permission.RECORD_AUDIO) }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (!Settings.canDrawOverlays(this)) {
+                      startActivity(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                      )
+                      finish() // izni verince uygulamayi tekrar ac
+                      return
+                  }
+                  notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+              }
+          }
+          EOF_5
+          cat > app/src/main/java/com/example/altyazi/SubtitleService.kt <<'EOF_6'
+          package com.example.altyazi
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.media.*
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.IBinder
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.TextView
+          import com.google.mlkit.nl.languageid.LanguageIdentification
+          import com.google.mlkit.nl.translate.*
+          import com.k2fsa.sherpa.onnx.*
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.tasks.await
+
+          class SubtitleService : Service() {
+
+              private val MODEL = "tiny"
+
+              private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+              private lateinit var wm: WindowManager
+              private lateinit var button: TextView
+              private lateinit var subtitle: TextView
+              private var projection: MediaProjection? = null
+              private var recorder: AudioRecord? = null
+              private var recognizer: OfflineRecognizer? = null
+              private var loopJob: Job? = null
+              private val translators = mutableMapOf<String, Translator>()
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  startAsForeground()
+                  @Suppress("DEPRECATION")
+                  val data = intent?.getParcelableExtra<Intent>("data")
+                  val code = intent?.getIntExtra("code", Activity.RESULT_CANCELED) ?: return START_NOT_STICKY
+                  if (data == null) { stopSelf(); return START_NOT_STICKY }
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  projection = mpm.getMediaProjection(code, data).also {
+                      it.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() { stopSelf() }
+                      }, null)
+                  }
+                  addOverlay()
+                  scope.launch { recognizer = buildRecognizer() }
+                  return START_NOT_STICKY
+              }
+
+              private fun startAsForeground() {
+                  val ch = NotificationChannel("sub", "Altyazi", NotificationManager.IMPORTANCE_LOW)
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+                  val n = Notification.Builder(this, "sub")
+                      .setContentTitle("Altyazi ceviri calisiyor")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .build()
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+              }
+
+              private fun addOverlay() {
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  val type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+
+                  button = TextView(this).apply {
+                      text = "🌐"; textSize = 26f; setPadding(28, 20, 28, 20)
+                      setBackgroundColor(Color.parseColor("#99000000"))
+                      setOnClickListener { toggle() }
+                      setOnLongClickListener { stopSelf(); true }
+                  }
+                  wm.addView(button, WindowManager.LayoutParams(
+                      -2, -2, type, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.END; y = 400 })
+
+                  subtitle = TextView(this).apply {
+                      textSize = 18f; setTextColor(Color.WHITE); setPadding(24, 16, 24, 16)
+                      setBackgroundColor(Color.parseColor("#B3000000"))
+                      gravity = Gravity.CENTER; visibility = View.GONE
+                  }
+                  wm.addView(subtitle, WindowManager.LayoutParams(
+                      -1, -2, type,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.BOTTOM; y = 220 })
+              }
+
+              private fun toggle() {
+                  if (loopJob?.isActive == true) {
+                      loopJob?.cancel(); recorder?.stop(); recorder?.release(); recorder = null
+                      button.text = "🌐"; subtitle.visibility = View.GONE
+                  } else {
+                      if (recognizer == null) { show("Model yukleniyor, bekle..."); return }
+                      button.text = "⏹"
+                      loopJob = scope.launch { captureLoop() }
+                  }
+              }
+
+              private fun show(t: String) = subtitle.post {
+                  subtitle.text = t; subtitle.visibility = if (t.isBlank()) View.GONE else View.VISIBLE
+              }
+
+              private fun buildRecognizer(): OfflineRecognizer {
+                  val whisper = OfflineWhisperModelConfig(
+                      encoder = "$MODEL-encoder.int8.onnx",
+                      decoder = "$MODEL-decoder.int8.onnx",
+                      language = "",
+                      task = "transcribe",
+                      tailPaddings = 1000
+                  )
+                  val model = OfflineModelConfig(
+                      whisper = whisper, tokens = "$MODEL-tokens.txt",
+                      numThreads = 4, debug = false, provider = "cpu"
+                  )
+                  return OfflineRecognizer(assets, OfflineRecognizerConfig(
+                      featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
+                      modelConfig = model
+                  ))
+              }
+
+              private suspend fun captureLoop() {
+                  val rate = 16000
+                  val capture = AudioPlaybackCaptureConfiguration.Builder(projection!!)
+                      .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                      .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                      .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                      .build()
+                  val fmt = AudioFormat.Builder()
+                      .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                      .setSampleRate(rate)
+                      .setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()
+                  @Suppress("MissingPermission")
+                  recorder = AudioRecord.Builder()
+                      .setAudioPlaybackCaptureConfig(capture)
+                      .setAudioFormat(fmt)
+                      .setBufferSizeInBytes(rate * 2 * 2).build()
+                  recorder!!.startRecording()
+
+                  val chunk = rate * 4
+                  while (currentCoroutineContext().isActive) {
+                      val buf = ShortArray(chunk)
+                      var read = 0
+                      while (read < chunk && currentCoroutineContext().isActive) {
+                          val n = recorder?.read(buf, read, chunk - read) ?: break
+                          if (n <= 0) break
+                          read += n
+                      }
+                      if (read < chunk) break
+                      val floats = FloatArray(chunk) { buf[it] / 32768f }
+                      if (floats.maxOf { kotlin.math.abs(it) } < 0.01f) continue
+
+                      val stream = recognizer!!.createStream()
+                      stream.acceptWaveform(floats, rate)
+                      recognizer!!.decode(stream)
+                      val result = recognizer!!.getResult(stream)
+                      stream.release()
+
+                      val text = result.text.trim()
+                      if (text.isNotEmpty()) show(translateToTurkish(text, result.lang))
+                  }
+              }
+
+              private suspend fun translateToTurkish(text: String, whisperLang: String): String {
+                  return try {
+                      var code = whisperLang.replace(Regex("[^a-z]"), "")
+                      if (code.isEmpty()) {
+                          code = LanguageIdentification.getClient().identifyLanguage(text).await()
+                      }
+                      if (code == "tr" || code == "und") return text
+                      val src = TranslateLanguage.fromLanguageTag(code) ?: return text
+                      val tr = translators.getOrPut(src) {
+                          Translation.getClient(
+                              TranslatorOptions.Builder()
+                                  .setSourceLanguage(src)
+                                  .setTargetLanguage(TranslateLanguage.TURKISH).build()
+                          )
+                      }
+                      tr.downloadModelIfNeeded().await()
+                      tr.translate(text).await()
+                  } catch (e: Exception) {
+                      text
+                  }
+              }
+
+              override fun onDestroy() {
+                  scope.cancel()
+                  recorder?.release()
+                  projection?.stop()
+                  translators.values.forEach { it.close() }
+                  recognizer?.release()
+                  runCatching { wm.removeView(button); wm.removeView(subtitle) }
+                  super.onDestroy()
+              }
+          }
+          EOF_6
+
+      - name: Model ve sherpa-onnx kutuphanesini indir
+        run: |
+          curl -fL -o model.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2
+          tar xf model.tar.bz2
+          cp sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx app/src/main/assets/
+          cp sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx app/src/main/assets/
+          cp sherpa-onnx-whisper-tiny/tiny-tokens.txt app/src/main/assets/
+          curl -fL -o app/libs/sherpa-onnx.aar https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar
+          ls -la app/src/main/assets app/libs
+
+      - name: APK derle
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Release olarak yayinla
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Altyazi Ceviri build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
